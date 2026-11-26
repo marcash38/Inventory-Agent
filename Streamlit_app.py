@@ -120,6 +120,484 @@ with st.sidebar:
     st.divider()
     st.caption("Powered by `inventory_tools.py` & `inventory_agent.py`")
 
+    # Data Upload Section (Last section in the sidebar)
+    st.divider()
+    st.subheader("Data Upload")
+    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+
+# =====================================================================
+# CSV Data Processing & Multicriteria Classification Helpers
+# =====================================================================
+
+def clean_numeric_series(series: pd.Series) -> pd.Series:
+    """Safely converts string or numeric series to float, stripping currency symbols and commas."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0.0)
+    return (
+        series.astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .pipe(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+
+def assign_pareto_classes(series: pd.Series, cutoffs=(0.70, 0.90, 0.98)) -> pd.Series:
+    """
+    Assigns Pareto inventory classes (A, B, C, D) to a numeric series sorted descending.
+    Cutoffs:
+      - Cumulative volume <= 70% -> Class A (Fast movers / High monetary value)
+      - Cumulative volume 70% - 90% -> Class B (Moderate importance)
+      - Cumulative volume 90% - 98% -> Class C (Low importance)
+      - Cumulative volume > 98% -> Class D (Very low / trailing velocity)
+    """
+    sorted_s = series.sort_values(ascending=False, kind="mergesort")
+    total = float(sorted_s.sum())
+    if total <= 0:
+        return pd.Series("D", index=series.index)
+    shares = (sorted_s / total).round(6)
+    cum_shares = shares.cumsum().round(6)
+    prev_cum = (cum_shares - shares).round(6)
+
+    class_list = []
+    for cum, prev in zip(cum_shares, prev_cum):
+        if prev < cutoffs[0] or cum <= cutoffs[0]:
+            class_list.append("A")
+        elif prev < cutoffs[1] or cum <= cutoffs[1]:
+            class_list.append("B")
+        elif prev < cutoffs[2] or cum <= cutoffs[2]:
+            class_list.append("C")
+        else:
+            class_list.append("D")
+
+    assigned_series = pd.Series(class_list, index=sorted_s.index)
+    return assigned_series.loc[series.index]
+
+def get_top_items_by_sales(df_classified: pd.DataFrame, class_label: str, top_n: int = 5) -> pd.DataFrame:
+    """
+    Extracts the top N items sorted by Sales ($) descending for a specified final multicriteria class.
+    Returns a DataFrame with columns:
+    Item Number, Item Name, Sales ($), Hits, Final Multicriteria Class
+    """
+    sub = df_classified[df_classified["Multicriteria Class"] == class_label].copy()
+    sub_sorted = sub.sort_values(by="_Sales_Numeric", ascending=False).head(top_n)
+
+    top_df = pd.DataFrame({
+        "Item Number": sub_sorted["Item Number"],
+        "Item Name": sub_sorted["Item Name"],
+        "Sales ($)": sub_sorted["_Sales_Numeric"].apply(lambda x: f"${x:,.2f}"),
+        "Hits": sub_sorted["_Hits_Numeric"].apply(lambda x: f"{x:,.0f}"),
+        "Final Multicriteria Class": sub_sorted["Multicriteria Class"]
+    })
+    return top_df
+
+def perform_multicriteria_classification(
+    df: pd.DataFrame,
+    sales_col: str = "Sales ($)",
+    hits_col: str = "Hits",
+    w_sales: float = 0.5,
+    w_hits: float = 0.5
+) -> pd.DataFrame:
+    """
+    Performs multicriteria inventory classification into A, B, C, and D classes
+    using Sales ($) (revenue volume) and Hits (pick/transaction frequency).
+    Adds classification results and cumulative shares to the dataframe.
+    Guarantees 100% record retention with zero dropped or duplicated items.
+    """
+    res = df.copy()
+    original_index = res.index
+    res = res.reset_index(drop=True)
+
+    clean_sales = clean_numeric_series(res[sales_col])
+    clean_hits = clean_numeric_series(res[hits_col])
+
+    res["_Sales_Numeric"] = clean_sales
+    res["_Hits_Numeric"] = clean_hits
+
+    # Single-dimension Pareto classifications
+    res["Sales Class"] = assign_pareto_classes(clean_sales)
+    res["Hits Class"] = assign_pareto_classes(clean_hits)
+
+    # Share calculations
+    tot_sales = float(clean_sales.sum())
+    tot_hits = float(clean_hits.sum())
+
+    sales_share = (clean_sales / tot_sales) if tot_sales > 0 else pd.Series(0.0, index=res.index)
+    hits_share = (clean_hits / tot_hits) if tot_hits > 0 else pd.Series(0.0, index=res.index)
+
+    # Cumulative percentages for both dimensions
+    sales_sorted_idx = clean_sales.sort_values(ascending=False, kind="mergesort").index
+    hits_sorted_idx = clean_hits.sort_values(ascending=False, kind="mergesort").index
+
+    cum_sales_pct = (clean_sales.loc[sales_sorted_idx] / tot_sales * 100).cumsum().round(2) if tot_sales > 0 else pd.Series(0.0, index=sales_sorted_idx)
+    cum_hits_pct = (clean_hits.loc[hits_sorted_idx] / tot_hits * 100).cumsum().round(2) if tot_hits > 0 else pd.Series(0.0, index=hits_sorted_idx)
+
+    res["Cumulative Sales %"] = cum_sales_pct.reindex(res.index)
+    res["Cumulative Hits %"] = cum_hits_pct.reindex(res.index)
+
+    # Multi-attribute composite score and Pareto classification
+    composite_score = (w_sales * sales_share + w_hits * hits_share).round(6)
+    res["Composite Score"] = composite_score
+    res["Multicriteria Class"] = assign_pareto_classes(composite_score)
+
+    # 2D Cross-criteria matrix identifier (e.g. AA, AB, BA, CD)
+    res["Matrix Class"] = res["Sales Class"] + res["Hits Class"]
+
+    res.index = original_index
+    return res
+
+# =====================================================================
+# CSV Data Processing & Analysis (when CSV is uploaded in sidebar)
+# =====================================================================
+
+if uploaded_file is not None:
+    st.header("📁 Uploaded Inventory Data & Analysis")
+    try:
+        # 1. Read CSV file into pandas DataFrame
+        df_uploaded = pd.read_csv(uploaded_file)
+
+        # Normalize column names by stripping whitespace
+        df_uploaded.columns = df_uploaded.columns.str.strip()
+
+        # Schema 1: Inventory Overview (Product, Category, Units, Unit Cost)
+        overview_required = ["Product", "Category", "Units", "Unit Cost"]
+        has_overview_schema = set(overview_required).issubset(df_uploaded.columns)
+
+        # Schema 2: Multicriteria Classification (Item Number, Item Name, UoM, Sales ($), Hits)
+        classification_required = ["Item Number", "Item Name", "UoM", "Hits"]
+        sales_col = None
+        for candidate in ["Sales ($)", "Sales", "Sales($)", "Sales Amount", "Sales_Amount", "Revenue"]:
+            if candidate in df_uploaded.columns:
+                sales_col = candidate
+                break
+
+        has_classification_schema = set(classification_required).issubset(df_uploaded.columns) and (sales_col is not None)
+
+        if not has_overview_schema and not has_classification_schema:
+            st.error(
+                "⚠️ Uploaded CSV file does not match either supported inventory schema:\n\n"
+                "• **Multicriteria Classification Schema:** Requires `Item Number`, `Item Name`, `UoM`, `Sales ($)`, `Hits`\n"
+                "• **Inventory Overview Schema:** Requires `Product`, `Category`, `Units`, `Unit Cost`\n\n"
+                f"**Columns detected in uploaded file:** {', '.join(df_uploaded.columns)}"
+            )
+
+        # =================================================================
+        # MODULE A: Multicriteria Inventory Classification (Sales & Hits)
+        # =================================================================
+        if has_classification_schema:
+            st.subheader("🏷️ Multicriteria Inventory Classification (A, B, C, D Classes)")
+            st.caption(
+                "Combines **Sales ($)** (monetary revenue impact) and **Hits** (pick transaction velocity) "
+                "to perform multi-attribute Pareto inventory classification."
+            )
+
+            # Execute Multicriteria Classification using pandas
+            df_classified = perform_multicriteria_classification(
+                df_uploaded,
+                sales_col=sales_col,
+                hits_col="Hits",
+                w_sales=0.5,
+                w_hits=0.5
+            )
+
+            # Metadata & Data Integrity Audit
+            total_items = len(df_uploaded)
+            classified_items = len(df_classified)
+            missing_items = int(df_classified["Multicriteria Class"].isna().sum())
+            duplicate_records = int(df_uploaded.duplicated().sum())
+            duplicate_item_nums = int(df_uploaded["Item Number"].duplicated().sum()) if "Item Number" in df_uploaded.columns else 0
+
+            meta_c1, meta_c2, meta_c3, meta_c4 = st.columns([1, 1, 1, 1.5])
+            meta_c1.metric("Total Items Uploaded", f"{total_items:,}")
+            meta_c2.metric("Total Items Classified", f"{classified_items:,}")
+            meta_c3.metric("Missing Records", f"{missing_items}")
+            meta_c4.metric("Duplicate Items", f"{duplicate_item_nums}")
+
+            # Audit confirmation badge
+            if total_items == classified_items and missing_items == 0 and duplicate_records == 0:
+                st.success(
+                    f"✅ **Audit Verified:** All **{total_items}** inventory items were classified "
+                    f"without missing or duplicated records (100% record retention and completeness)."
+                )
+            else:
+                st.warning(
+                    f"⚠️ **Audit Notice:** {classified_items}/{total_items} items classified. "
+                    f"Missing: {missing_items}, Duplicate records: {duplicate_records}."
+                )
+
+            # Display Classification Rules and Thresholds
+            with st.expander("📐 Classification Rules & Thresholds Used to Assign Each Class", expanded=True):
+                st.markdown(r"""
+                **Multicriteria Inventory Classification Rules & Thresholds:**
+
+                1. **Monetary Dimension — Sales ($) Pareto Thresholds:**
+                   - **Class A:** Cumulative Sales $\le 70\%$ (Top revenue drivers / Highest monetary velocity)
+                   - **Class B:** Cumulative Sales $70\% - 90\%$ (Next 20% of revenue / Moderate monetary velocity)
+                   - **Class C:** Cumulative Sales $90\% - 98\%$ (Next 8% of revenue / Low monetary velocity)
+                   - **Class D:** Cumulative Sales $> 98\%$ (Trailing 2% or negligible revenue)
+
+                2. **Transaction Velocity Dimension — Hits Pareto Thresholds:**
+                   - **Class A:** Cumulative Hits $\le 70\%$ (Fast movers / High pick frequency lines)
+                   - **Class B:** Cumulative Hits $70\% - 90\%$ (Next 20% of picks / Moderate pick frequency)
+                   - **Class C:** Cumulative Hits $90\% - 98\%$ (Next 8% of picks / Slow pick frequency)
+                   - **Class D:** Cumulative Hits $> 98\%$ (Trailing 2% / Dead stock / Rare picks)
+
+                3. **Multi-Attribute Composite Scoring Formula:**
+                   $$\text{Composite Score}_i = 0.50 \times \left(\frac{\text{Sales}_i}{\sum \text{Sales}}\right) + 0.50 \times \left(\frac{\text{Hits}_i}{\sum \text{Hits}}\right)$$
+                   - Equal weighting ($50\%$ Sales contribution $+ 50\%$ Hits contribution).
+                   - Items are sorted by Composite Score descending and assigned to **Final Multicriteria Class** using the standard Pareto cumulative cutoffs ($\le 70\% \to \text{A}$, $70\%-90\% \to \text{B}$, $90\%-98\% \to \text{C}$, $> 98\% \to \text{D}$).
+
+                4. **2D Operational Cross-Classification Matrix (`Matrix Class`):**
+                   - Combines individual `Sales Class` and `Hits Class` (e.g. `AA`, `AB`, `AD`, `DA`, `DD`) for warehouse slotting, cycle count frequencies, and replenishment review policies.
+                """)
+
+            tot_portfolio_sales = float(df_classified["_Sales_Numeric"].sum())
+            tot_portfolio_hits = float(df_classified["_Hits_Numeric"].sum())
+
+            # Count of items in each Multicriteria Class
+            class_counts = df_classified["Multicriteria Class"].value_counts().to_dict()
+            cnt_a = class_counts.get("A", 0)
+            cnt_b = class_counts.get("B", 0)
+            cnt_c = class_counts.get("C", 0)
+            cnt_d = class_counts.get("D", 0)
+            n_items = len(df_classified) if len(df_classified) > 0 else 1
+
+            # Sales in each class
+            class_sales = df_classified.groupby("Multicriteria Class")["_Sales_Numeric"].sum().to_dict()
+            sales_a = class_sales.get("A", 0.0)
+            sales_b = class_sales.get("B", 0.0)
+            sales_c = class_sales.get("C", 0.0)
+            sales_d = class_sales.get("D", 0.0)
+
+            # Executive KPI Cards
+            st.markdown("##### Executive Portfolio Summary")
+            kpi_cols = st.columns(6)
+            kpi_cols[0].metric("Total Sales ($)", f"${tot_portfolio_sales:,.2f}")
+            kpi_cols[1].metric("Total Pick Hits", f"{tot_portfolio_hits:,.0f}")
+            kpi_cols[2].metric("Class A Items", f"{cnt_a} ({cnt_a/n_items*100:.1f}%)", f"${sales_a:,.0f}")
+            kpi_cols[3].metric("Class B Items", f"{cnt_b} ({cnt_b/n_items*100:.1f}%)", f"${sales_b:,.0f}")
+            kpi_cols[4].metric("Class C Items", f"{cnt_c} ({cnt_c/n_items*100:.1f}%)", f"${sales_c:,.0f}")
+            kpi_cols[5].metric("Class D Items", f"{cnt_d} ({cnt_d/n_items*100:.1f}%)", f"${sales_d:,.0f}")
+
+            # =============================================================
+            # Top 5 Items by Sales for Each Final Inventory Class
+            # =============================================================
+            st.markdown("---")
+            st.subheader("Top 5 Items by Sales for Each Final Inventory Class")
+            st.caption(
+                "Separate tables for Classes A, B, C, and D, each showing Item Number, Item Name, "
+                "Sales ($), Hits, and Final Multicriteria Class, sorted from highest to lowest Sales ($)."
+            )
+
+            col_top_a, col_top_b = st.columns(2)
+            with col_top_a:
+                st.markdown("##### 🥇 Class A — Top 5 Items by Sales")
+                tbl_a = get_top_items_by_sales(df_classified, "A", top_n=5)
+                if len(tbl_a) > 0:
+                    st.dataframe(tbl_a, width="stretch")
+                else:
+                    st.info("No items in Class A.")
+
+                st.markdown("##### 🥉 Class C — Top 5 Items by Sales")
+                tbl_c = get_top_items_by_sales(df_classified, "C", top_n=5)
+                if len(tbl_c) > 0:
+                    st.dataframe(tbl_c, width="stretch")
+                else:
+                    st.info("No items in Class C.")
+
+            with col_top_b:
+                st.markdown("##### 🥈 Class B — Top 5 Items by Sales")
+                tbl_b = get_top_items_by_sales(df_classified, "B", top_n=5)
+                if len(tbl_b) > 0:
+                    st.dataframe(tbl_b, width="stretch")
+                else:
+                    st.info("No items in Class B.")
+
+                st.markdown("##### 📦 Class D — Top 5 Items by Sales")
+                tbl_d = get_top_items_by_sales(df_classified, "D", top_n=5)
+                if len(tbl_d) > 0:
+                    st.dataframe(tbl_d, width="stretch")
+                else:
+                    st.info("No items in Class D.")
+
+            st.markdown("---")
+
+            # Analytics Tabs
+            tab_summary, tab_matrix, tab_table = st.tabs([
+                "📊 Classification Distribution & Charts",
+                "🎯 2D Multicriteria Matrix (Sales × Hits)",
+                "📋 Complete Classified Inventory Table"
+            ])
+
+            with tab_summary:
+                # Grouped summary table
+                summary_records = []
+                for cls_label in ["A", "B", "C", "D"]:
+                    sub = df_classified[df_classified["Multicriteria Class"] == cls_label]
+                    cls_items = len(sub)
+                    cls_sales_val = float(sub["_Sales_Numeric"].sum())
+                    cls_hits_val = float(sub["_Hits_Numeric"].sum())
+                    summary_records.append({
+                        "Class": cls_label,
+                        "Item Count": cls_items,
+                        "% of Items": f"{(cls_items / n_items * 100):.1f}%",
+                        "Total Sales ($)": f"${cls_sales_val:,.2f}",
+                        "% of Sales": f"{(cls_sales_val / tot_portfolio_sales * 100 if tot_portfolio_sales > 0 else 0.0):.1f}%",
+                        "Total Hits": f"{cls_hits_val:,.0f}",
+                        "% of Hits": f"{(cls_hits_val / tot_portfolio_hits * 100 if tot_portfolio_hits > 0 else 0.0):.1f}%"
+                    })
+                df_summary = pd.DataFrame(summary_records)
+                st.dataframe(df_summary, width="stretch")
+
+                # Charts
+                chart_col1, chart_col2 = st.columns(2)
+                with chart_col1:
+                    st.markdown("**Item Count by Multicriteria Class**")
+                    chart_counts = pd.DataFrame({
+                        "Class": ["A", "B", "C", "D"],
+                        "Items": [cnt_a, cnt_b, cnt_c, cnt_d]
+                    }).set_index("Class")
+                    st.bar_chart(chart_counts["Items"])
+
+                with chart_col2:
+                    st.markdown("**Total Sales ($) by Multicriteria Class**")
+                    chart_sales_df = pd.DataFrame({
+                        "Class": ["A", "B", "C", "D"],
+                        "Sales ($)": [sales_a, sales_b, sales_c, sales_d]
+                    }).set_index("Class")
+                    st.bar_chart(chart_sales_df["Sales ($)"])
+
+            with tab_matrix:
+                st.markdown("##### 2D Cross-Classification Matrix (`Sales Class` × `Hits Class`)")
+                st.caption("Distribution of SKUs across monetary volume (Sales) and physical pick frequency (Hits).")
+                matrix_df = pd.crosstab(
+                    df_classified["Sales Class"],
+                    df_classified["Hits Class"],
+                    margins=True,
+                    margins_name="Total"
+                )
+                st.dataframe(matrix_df, width="stretch")
+
+                st.markdown("""
+                **Operational Management Strategies:**
+                - **Class A-A (High Sales, High Hits):** Fast-moving top earners. Place near shipping bays; implement continuous review, automated replenishment, and tight cycle counts.
+                - **Class A-D (High Sales, Low Hits):** High dollar value, slow movement. Expensive capital risk; store in secure high-bay locations with periodic review.
+                - **Class D-A (Low Sales, High Hits):** Low unit revenue, high pick frequency. Essential consumable components; position at ergonomic pick faces to minimize picker travel.
+                - **Class D-D (Low Sales, Low Hits):** Dead or obsolete stock candidates. Review for vendor rationalization, minimum batch sizing, or liquidation.
+                """)
+
+            with tab_table:
+                st.markdown("##### Enriched Inventory Dataset")
+                filter_choice = st.radio(
+                    "Filter by Multicriteria Class:",
+                    ["All", "A", "B", "C", "D"],
+                    horizontal=True
+                )
+
+                df_view = df_classified if filter_choice == "All" else df_classified[df_classified["Multicriteria Class"] == filter_choice]
+
+                # Prepare clean display DataFrame
+                cols_to_show = [
+                    "Item Number", "Item Name", "UoM", sales_col, "Hits",
+                    "Sales Class", "Hits Class", "Multicriteria Class", "Matrix Class",
+                    "Cumulative Sales %", "Cumulative Hits %"
+                ]
+                existing_cols_to_show = [c for c in cols_to_show if c in df_view.columns]
+                df_display = df_view[existing_cols_to_show].copy()
+
+                # Currency formatting for display
+                df_display[sales_col] = df_view["_Sales_Numeric"].apply(lambda x: f"${x:,.2f}")
+                df_display["Hits"] = df_view["_Hits_Numeric"].apply(lambda x: f"{x:,.0f}")
+                df_display["Cumulative Sales %"] = df_view["Cumulative Sales %"].apply(lambda x: f"{x:.2f}%")
+                df_display["Cumulative Hits %"] = df_view["Cumulative Hits %"].apply(lambda x: f"{x:.2f}%")
+
+                st.dataframe(df_display, width="stretch")
+
+                # Export Classified CSV
+                csv_download = df_classified.drop(columns=["_Sales_Numeric", "_Hits_Numeric"]).to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Classified Inventory CSV",
+                    data=csv_download,
+                    file_name="classified_inventory_results.csv",
+                    mime="text/csv",
+                    width="stretch"
+                )
+
+        # =================================================================
+        # MODULE B: Existing Inventory Overview (Product, Category, Units, Unit Cost)
+        # =================================================================
+        if has_overview_schema:
+            st.subheader("📊 Basic Inventory Portfolio Overview")
+            meta_c1, meta_c2, meta_c3 = st.columns([1, 1, 2])
+            meta_c1.metric("Number of Rows", f"{len(df_uploaded):,}")
+            meta_c2.metric("Number of Columns", f"{len(df_uploaded.columns):,}")
+            meta_c3.write(f"**Column Names:** {', '.join(df_uploaded.columns)}")
+
+            st.markdown("##### Uploaded Dataframe Preview")
+            st.dataframe(df_uploaded, width="stretch")
+
+            # DATA ANALYSIS using pandas and the uploaded dataframe:
+            df_analysis = df_uploaded.copy()
+            df_analysis["Units"] = pd.to_numeric(df_analysis["Units"], errors="coerce").fillna(0)
+            df_analysis["Unit Cost"] = pd.to_numeric(df_analysis["Unit Cost"], errors="coerce").fillna(0.0)
+
+            # 1. Calculate total Units
+            total_units = float(df_analysis["Units"].sum())
+
+            # 2. Calculate average Unit Cost
+            avg_unit_cost = float(df_analysis["Unit Cost"].mean()) if len(df_analysis) > 0 else 0.0
+
+            # 3. Identify Product with highest Units
+            if len(df_analysis) > 0:
+                highest_idx = df_analysis["Units"].idxmax()
+                highest_product = str(df_analysis.loc[highest_idx, "Product"])
+                highest_units = float(df_analysis.loc[highest_idx, "Units"])
+            else:
+                highest_product = "N/A"
+                highest_units = 0.0
+
+            # 4. Group data by Category and calculate total Units for each Category
+            category_units_df = (
+                df_analysis.groupby("Category")["Units"]
+                .sum()
+                .reset_index()
+                .sort_values(by="Units", ascending=False)
+            )
+
+            # 5. Create new calculated column: Inventory Value = Units × Unit Cost
+            df_analysis["Inventory Value"] = df_analysis["Units"] * df_analysis["Unit Cost"]
+
+            # 6. Calculate total Inventory Value across all products
+            total_inventory_value = float(df_analysis["Inventory Value"].sum())
+
+            # RESULTS DISPLAY
+            st.markdown("##### Key Inventory Metrics")
+            kpi_c1, kpi_c2, kpi_c3, kpi_c4 = st.columns(4)
+            kpi_c1.metric("Total Units", f"{total_units:,.0f}")
+            kpi_c2.metric("Average Unit Cost", f"${avg_unit_cost:,.2f}")
+            kpi_c3.metric("Product with Highest Units", f"{highest_product}", f"{highest_units:,.0f} units")
+            kpi_c4.metric("Total Inventory Value", f"${total_inventory_value:,.2f}")
+
+            # Total Units by Category
+            st.markdown("##### Total Units by Category")
+            cat_col1, cat_col2 = st.columns([1, 1.2])
+            with cat_col1:
+                st.dataframe(category_units_df, width="stretch")
+            with cat_col2:
+                st.bar_chart(category_units_df.set_index("Category")["Units"])
+
+            # Dataframe including the new Inventory Value column with currency formatting
+            st.markdown("##### Complete Inventory Dataframe (with Calculated Inventory Value)")
+            df_display = df_analysis.copy()
+            df_display["Unit Cost"] = df_display["Unit Cost"].apply(lambda x: f"${x:,.2f}")
+            df_display["Inventory Value"] = df_display["Inventory Value"].apply(lambda x: f"${x:,.2f}")
+            st.dataframe(df_display, width="stretch")
+
+    except Exception as e:
+        st.error(f"Error reading or processing CSV file: {str(e)}")
+
+    st.divider()
+
 # =====================================================================
 # Model Selection Dropdown
 # =====================================================================
@@ -226,7 +704,7 @@ if model == "Economic Order Quantity (EOQ)":
             help="Annual operating or business days (default: 365)."
         )
 
-    if st.button("Calculate EOQ", type="primary", use_container_width=True):
+    if st.button("Calculate EOQ", type="primary", width="stretch"):
         try:
             # Deterministic execution via inventory_tools.py
             result = calculate_eoq(
@@ -357,9 +835,9 @@ elif model == "Quantity Discount Model":
         {"Tier": 2, "Min Qty": 500, "Max Qty": 999, "Unit Price ($)": 18.0},
         {"Tier": 3, "Min Qty": 1000, "Max Qty": 999999, "Unit Price ($)": 16.0},
     ]
-    edited_tiers = st.data_editor(pd.DataFrame(default_tiers), num_rows="dynamic", use_container_width=True)
+    edited_tiers = st.data_editor(pd.DataFrame(default_tiers), num_rows="dynamic", width="stretch")
 
-    if st.button("Calculate Quantity Discount", type="primary", use_container_width=True):
+    if st.button("Calculate Quantity Discount", type="primary", width="stretch"):
         try:
             # Parse schedule from edited table
             schedule = []
@@ -418,7 +896,7 @@ elif model == "Quantity Discount Model":
                         "Total Annual Cost ($)": f"${t.total_annual_cost:,.2f}",
                         "Optimal?": "⭐ BEST" if t.tier_id == result.optimal_tier_id else ""
                     })
-                st.dataframe(pd.DataFrame(tier_rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(tier_rows), width="stretch")
 
                 # Tier Cost Comparison Bar Chart
                 st.subheader("📊 Total Annual Cost Comparison by Tier")
@@ -524,7 +1002,7 @@ elif model == "Safety Stock and Reorder Point":
 
     st.info(f"**Detected Uncertainty Scenario:** {regime_label}")
 
-    if st.button("Calculate Safety Stock & ROP", type="primary", use_container_width=True):
+    if st.button("Calculate Safety Stock & ROP", type="primary", width="stretch"):
         try:
             result = calculate_rop(
                 mean_demand=mean_demand,
@@ -679,7 +1157,7 @@ elif model == "Fixed-Period Review":
         else:
             inventory_position = st.number_input("Net Inventory Position (IP)", min_value=-500.0, value=120.0, step=10.0)
 
-    if st.button("Calculate Periodic Review Order", type="primary", use_container_width=True):
+    if st.button("Calculate Periodic Review Order", type="primary", width="stretch"):
         try:
             result = calculate_periodic_review(
                 review_period=review_period,
@@ -809,7 +1287,7 @@ elif model == "Newsvendor Model":
             uniform_a = st.number_input("Minimum Demand (a)", min_value=0.0, value=200.0, step=25.0)
             uniform_b = st.number_input("Maximum Demand (b)", min_value=1.0, value=800.0, step=25.0)
 
-    if st.button("Calculate Newsvendor Order Quantity", type="primary", use_container_width=True):
+    if st.button("Calculate Newsvendor Order Quantity", type="primary", width="stretch"):
         try:
             result = calculate_newsvendor(
                 selling_price=selling_price,
@@ -912,27 +1390,27 @@ elif model == "🤖 AI Natural Language Decision Agent":
     preset_cols = st.columns(5)
     sample_q = ""
 
-    if preset_cols[0].button("EOQ Inquiry", use_container_width=True):
+    if preset_cols[0].button("EOQ Inquiry", width="stretch"):
         st.session_state["query_input"] = (
             "We sell 12,000 units of widgets per year. Ordering cost is $50, unit purchase price is $10, "
             "and annual holding rate is 20%. What is our EOQ and total cost?"
         )
-    if preset_cols[1].button("Quantity Discount", use_container_width=True):
+    if preset_cols[1].button("Quantity Discount", width="stretch"):
         st.session_state["query_input"] = (
             "Annual demand of 5,000 units with cost per order of $50. Percentage holding cost is 20%. "
             "Price schedule: 1-499 units at unit price $20, 500-999 units at $18, 1000+ units at $16."
         )
-    if preset_cols[2].button("Safety Stock & ROP", use_container_width=True):
+    if preset_cols[2].button("Safety Stock & ROP", width="stretch"):
         st.session_state["query_input"] = (
             "Average demand is 100 with a standard deviation of 20. Lead time averages 4 days with a standard deviation of 1 day. "
             "Target service level is 95%."
         )
-    if preset_cols[3].button("Periodic Review", use_container_width=True):
+    if preset_cols[3].button("Periodic Review", width="stretch"):
         st.session_state["query_input"] = (
             "Review period is 2 weeks. Supplier lead time is 1 week. Weekly demand averages 100 units with std dev 20. "
             "On-hand inventory is 80 units, on-order inventory is 50 units, and backorders are 10 units. Service level is 95%."
         )
-    if preset_cols[4].button("Newsvendor", use_container_width=True):
+    if preset_cols[4].button("Newsvendor", width="stretch"):
         st.session_state["query_input"] = (
             "A fashion retailer sells ski jackets for selling price $150, purchase cost $60, and salvage value $20. "
             "Forecast demand is normal with mean 500 jackets and demand standard deviation of 100."
@@ -944,7 +1422,7 @@ elif model == "🤖 AI Natural Language Decision Agent":
         height=100
     )
 
-    if st.button("Submit to Decision Agent", type="primary", use_container_width=True):
+    if st.button("Submit to Decision Agent", type="primary", width="stretch"):
         if not user_query.strip():
             st.warning("Please enter a question.")
         else:
